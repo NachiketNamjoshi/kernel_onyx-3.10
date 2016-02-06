@@ -274,6 +274,19 @@ struct mdss_dsi_ctrl_pdata {
 	int rst_gpio;
 	int disp_en_gpio;
 	int bklt_en_gpio;
+
+#ifdef VENDOR_EDIT
+//add for samsung_s6e3fa3 vci enable
+	int vci_en_gpio;
+	int esd_check_gpio;
+	int err_fg_gpio;
+#endif
+#ifdef VENDOR_EDIT
+/* 2014/08/10  Add for 14021 lcd enable */
+	int disp_en_gpio76;
+#endif /*CONFIG_VENDOR_EDIT*/
+	int disp_te_gpio;
+
 	int mode_gpio;
 	int bklt_ctrl;	/* backlight ctrl */
 	int pwm_period;
@@ -394,6 +407,11 @@ static inline const char *__mdss_dsi_pm_name(enum dsi_pm_type module)
 
 static inline const char *__mdss_dsi_pm_supply_node_name(
 	enum dsi_pm_type module)
+#ifdef VENDOR_EDIT
+//add for samsung_s6e3fa3 vci en
+int mdss_dsi_panel_vci_en(struct mdss_panel_data *pdata, int enable);
+#endif
+static inline bool mdss_dsi_broadcast_mode_enabled(void)
 {
 	switch (module) {
 	case DSI_CORE_PM:	return "qcom,core-supply-entries";

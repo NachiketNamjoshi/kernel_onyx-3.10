@@ -18,10 +18,18 @@
 #include <linux/aio.h>
 #include <linux/falloc.h>
 
+#ifdef VENDOR_EDIT
+//hefaxi@filesystems, 2015/06/17, add for reserved memory
+#include <linux/statfs.h>
+#include <linux/namei.h>
+#include "fuse_shortcircuit.h"//add by liwei
+#endif
+
 static const struct file_operations fuse_direct_io_file_operations;
 
 static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
-			  int opcode, struct fuse_open_out *outargp)
+			  int opcode, struct fuse_open_out *outargp,
+			  struct file **lower_file)//add by liwei
 {
 	struct fuse_open_in inarg;
 	struct fuse_req *req;
@@ -45,6 +53,10 @@ static int fuse_send_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 	req->out.args[0].value = outargp;
 	fuse_request_send(fc, req);
 	err = req->out.h.error;
+#ifdef VENDOR_EDIT/*add by liwei*/
+	if (!err && req->private_lower_rw_file != NULL)
+		*lower_file =  req->private_lower_rw_file;
+#endif
 	fuse_put_request(fc, req);
 
 	return err;
@@ -57,7 +69,9 @@ struct fuse_file *fuse_file_alloc(struct fuse_conn *fc)
 	ff = kmalloc(sizeof(struct fuse_file), GFP_KERNEL);
 	if (unlikely(!ff))
 		return NULL;
-
+#ifdef VENDOR_EDIT/*Add by liwei*/
+	ff->rw_lower_file = NULL;
+#endif
 	ff->fc = fc;
 	ff->reserved_req = fuse_request_alloc(0);
 	if (unlikely(!ff->reserved_req)) {
@@ -153,7 +167,11 @@ int fuse_do_open(struct fuse_conn *fc, u64 nodeid, struct file *file,
 	if (!ff)
 		return -ENOMEM;
 
+#ifndef VENDOR_EDIT/*Add by liwei*/
 	err = fuse_send_open(fc, nodeid, file, opcode, &outarg);
+#else
+	err = fuse_send_open(fc, nodeid, file, opcode, &outarg, &(ff->rw_lower_file));
+#endif
 	if (err) {
 		fuse_file_free(ff);
 		return err;
@@ -242,7 +260,9 @@ void fuse_release_common(struct file *file, int opcode)
 	ff = file->private_data;
 	if (unlikely(!ff))
 		return;
-
+#ifdef VENDOR_EDIT/*Add by liwei*/
+		fuse_shortcircuit_release(ff);
+#endif
 	req = ff->reserved_req;
 	fuse_prepare_release(ff, file->f_flags, opcode);
 
@@ -878,8 +898,14 @@ out:
 static ssize_t fuse_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 				  unsigned long nr_segs, loff_t pos)
 {
+#ifdef VENDOR_EDIT/*add BY liwei*/
+	ssize_t ret_val;
+#endif
 	struct inode *inode = iocb->ki_filp->f_mapping->host;
 	struct fuse_conn *fc = get_fuse_conn(inode);
+#ifdef VENDOR_EDIT/*add BY liwei*/
+	struct fuse_file *ff = iocb->ki_filp->private_data;
+#endif
 
 	/*
 	 * In auto invalidate mode, always update attributes on read.
@@ -894,7 +920,16 @@ static ssize_t fuse_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
 			return err;
 	}
 
+#ifndef VENDOR_EDIT/*add BY liwei*/
 	return generic_file_aio_read(iocb, iov, nr_segs, pos);
+#else
+	if (ff && ff->rw_lower_file)
+		ret_val = fuse_shortcircuit_aio_read(iocb, iov, nr_segs, pos);
+	else
+		ret_val = generic_file_aio_read(iocb, iov, nr_segs, pos);
+	return ret_val;
+	
+#endif
 }
 
 static void fuse_write_fill(struct fuse_req *req, struct fuse_file *ff,
@@ -1127,6 +1162,9 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 {
 	struct file *file = iocb->ki_filp;
 	struct address_space *mapping = file->f_mapping;
+#ifdef VENDOR_EDIT
+	struct fuse_file *ff = file->private_data;
+#endif
 	size_t count = 0;
 	size_t ocount = 0;
 	ssize_t written = 0;
@@ -1135,8 +1173,69 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	ssize_t err;
 	struct iov_iter i;
 	loff_t endbyte = 0;
-
 	WARN_ON(iocb->ki_pos != pos);
+#ifdef VENDOR_EDIT
+//hefaxi@filesystems, 2015/06/17, add for reserved memory
+	struct kstatfs statfs;
+	u64 avail;
+	size_t size;
+	u32 reserved_blocks;
+	u32 reserved_bytes;
+	struct path data_partition_path;
+
+	reserved_bytes = get_fuse_conn(inode)->reserved_mem << 20;
+
+	if (reserved_bytes != 0) {
+
+		err = kern_path("/data",
+			LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &data_partition_path);
+		if (unlikely(err))
+		{
+			printk(KERN_INFO "Failed to get data partition path(%d)\n",
+				(int)err);
+			err = vfs_statfs(&file->f_path, &statfs);
+			if (unlikely(err))
+			{
+				printk(KERN_ERR "statfs file path error(%d)\n",
+					(int)err);
+				return err;
+			}
+		}
+		else
+		{
+			err = vfs_statfs(&data_partition_path, &statfs);
+			if (unlikely(err))
+			{
+				printk(KERN_INFO "statfs data partition error(%d)\n",
+					(int)err);
+				err = vfs_statfs(&file->f_path, &statfs);
+				if (unlikely(err))
+				{
+					printk(KERN_ERR "statfs file path error(%d)\n",
+						(int)err);
+					path_put(&data_partition_path);
+					return err;
+				}
+			}
+			path_put(&data_partition_path);
+		}
+
+		reserved_blocks = (reserved_bytes / statfs.f_bsize);
+
+		if (statfs.f_bavail < reserved_blocks)
+			statfs.f_bavail = 0;
+		else
+			statfs.f_bavail -= reserved_blocks;
+
+		avail = statfs.f_bavail * statfs.f_bsize;
+		size = iov_length(iov, nr_segs);
+
+		if ((u64)size > avail) {
+			return -ENOSPC;
+		}
+	}
+#endif
+	BUG_ON(iocb->ki_pos != pos);
 
 	ocount = 0;
 	err = generic_segment_checks(iov, &nr_segs, &ocount, VERIFY_READ);
@@ -1163,6 +1262,26 @@ static ssize_t fuse_file_aio_write(struct kiocb *iocb, const struct iovec *iov,
 	err = file_update_time(file);
 	if (err)
 		goto out;
+
+	file_update_time(file);
+#ifdef VENDOR_EDIT/*Add by liwei*/
+	if (ff && ff->rw_lower_file) {
+		/* Use iocb->ki_pos instead of pos to handle the cases of files
+		 * that are opened with O_APPEND. For example if multiple
+		 * processes open the same file with O_APPEND then the
+		 * iocb->ki_pos will not be equal to the new pos value that is
+		 * updated with the file size(to guarantee appends even when
+		 * the file has grown due to the writes by another process).
+		 * We should use iocb->pos here since the lower filesystem
+		 * is expected to adjust for O_APPEND anyway and may need to
+		 * adjust the size for the file changes that occur due to
+		 * some processes writing directly to the lower filesystem
+		 * without using fuse.
+		*/
+		written =  fuse_shortcircuit_aio_write(iocb, iov, nr_segs, iocb->ki_pos);
+		goto out;
+	}
+#endif
 
 	if (file->f_flags & O_DIRECT) {
 		written = generic_file_direct_write(iocb, iov, &nr_segs,

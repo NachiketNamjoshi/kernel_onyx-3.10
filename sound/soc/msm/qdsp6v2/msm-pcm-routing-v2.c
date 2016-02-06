@@ -3083,10 +3083,47 @@ static int msm_routing_put_use_ds1_or_ds2_control(
 	return 0;
 }
 
+
 static const struct snd_kcontrol_new use_ds1_or_ds2_controls[] = {
 	SOC_SINGLE_EXT("DS2 OnOff", SND_SOC_NOPM, 0,
 	1, 0, msm_routing_get_use_ds1_or_ds2_control,
 	msm_routing_put_use_ds1_or_ds2_control),
+
+static int msm_routing_put_dirac_headset_param_control(struct snd_kcontrol *kcontrol,
+		struct snd_ctl_elem_value *ucontrol) {
+	int rc = 0;
+	int ret = 0;
+	int Selectenable = ucontrol->value.integer.value[0];
+	pr_debug("%s: Selectenable = %d , srs_port_id = %d\n", __func__,Selectenable,srs_port_id);
+	if ((Selectenable < 0) || (Selectenable > 5)) {
+		pr_err(" %s Invalid arguments", __func__);
+		ret = -EINVAL;
+		goto done;
+	}
+
+	mutex_lock(&routing_lock);
+	rc = adm_set_dirac_enable_params(srs_port_id,
+				AUDIO_DIRAC_MODULEID,
+				DIRAC_PARAM_HEADSET,
+				Selectenable);
+	mutex_unlock(&routing_lock);
+	if (rc) {
+		pr_err("%s: set parameters failed\n", __func__);
+		return -EINVAL;
+	}
+
+done:
+	return ret;
+}
+
+
+static const struct snd_kcontrol_new set_dirac_enable_param_to_set_controls[] = {
+    SOC_SINGLE_EXT("SetDirac Enable", SND_SOC_NOPM ,
+	               0, 1, 0, msm_routing_get_dirac_enable_param_control,
+	               msm_routing_put_dirac_enable_param_control),
+	SOC_SINGLE_EXT("Select Dirac Headset", SND_SOC_NOPM ,
+	               0, 4, 0, msm_routing_get_dirac_headset_param_control,
+	               msm_routing_put_dirac_headset_param_control),
 };
 
 int msm_routing_get_rms_value_control(struct snd_kcontrol *kcontrol,

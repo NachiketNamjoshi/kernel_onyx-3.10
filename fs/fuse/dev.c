@@ -21,6 +21,9 @@
 #include <linux/splice.h>
 #include <linux/aio.h>
 #include <linux/freezer.h>
+#ifdef VENDOR_EDIT
+#include "fuse_shortcircuit.h"
+#endif
 
 MODULE_ALIAS_MISCDEV(FUSE_MINOR);
 MODULE_ALIAS("devname:fuse");
@@ -1872,6 +1875,10 @@ static ssize_t fuse_dev_do_write(struct fuse_conn *fc,
 
 	err = copy_out_args(cs, &req->out, nbytes);
 	fuse_copy_finish(cs);
+
+#ifdef VENDOR_EDIT/*Add shortcircuit*/
+fuse_setup_shortcircuit(fc, req);
+#endif
 
 	spin_lock(&fc->lock);
 	req->locked = 0;

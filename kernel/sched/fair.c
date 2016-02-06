@@ -30,6 +30,10 @@
 #include <linux/migrate.h>
 #include <linux/task_work.h>
 
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+#include <linux/oneplus.h>
+#endif
 #include <trace/events/sched.h>
 
 #include "sched.h"
@@ -4045,7 +4049,12 @@ int can_migrate_task(struct task_struct *p, struct lb_env *env)
  *
  * Called with both runqueues locked.
  */
+ #ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+static int move_one_task(struct lb_env *env, int *move_game)
+#else
 static int move_one_task(struct lb_env *env)
+#endif
 {
 	struct task_struct *p, *n;
 
@@ -4053,6 +4062,11 @@ static int move_one_task(struct lb_env *env)
 		if (!can_migrate_task(p, env))
 			continue;
 
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+        if(p->game_flag == PROCESS_RENDER_THREAD)
+            *move_game = 1;
+#endif
 		move_task(p, env);
 		/*
 		 * Right now, this is only the second place move_task()
@@ -4078,7 +4092,12 @@ static const unsigned int sched_nr_migrate_break = 32;
  *
  * Called with both runqueues locked.
  */
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+static int move_tasks(struct lb_env *env , int *move_game)
+#else
 static int move_tasks(struct lb_env *env)
+#endif
 {
 	struct list_head *tasks = &env->src_rq->cfs_tasks;
 	struct task_struct *p;
@@ -4114,6 +4133,11 @@ static int move_tasks(struct lb_env *env)
 		if ((load / 2) > env->imbalance)
 			goto next;
 
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+        if(p->game_flag == PROCESS_RENDER_THREAD)
+            *move_game = 1;
+#endif
 		move_task(p, env);
 		pulled++;
 		env->imbalance -= load;
@@ -5094,6 +5118,11 @@ static int load_balance(int this_cpu, struct rq *this_rq,
 	struct rq *busiest = NULL;
 	unsigned long flags;
 	struct cpumask *cpus = __get_cpu_var(load_balance_mask);
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+    int game_flag = 0;
+    int game_probe = 0;
+#endif
 
 	struct lb_env env = {
 		.sd		= sd,
@@ -5161,8 +5190,16 @@ more_balance:
 		 * ld_moved     - cumulative load moved across iterations
 		 */
 		cur_ld_moved = move_tasks(&env);
-		ld_moved += cur_ld_moved;
-		double_rq_unlock(env.dst_rq, busiest);
+		if (!env.loop)
+			update_h_load(env.src_cpu);
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+        ld_moved += move_tasks(&env, &game_probe);
+        game_flag |= game_probe;
+#else
+        ld_moved += move_tasks(&env);
+#endif
+		double_rq_unlock(this_rq, busiest);
 		local_irq_restore(flags);
 
 		/*
@@ -5289,7 +5326,24 @@ more_balance:
 						   0, (void *)&mnd);
 			per_cpu(dbs_boost_needed, this_cpu) = false;
 			per_cpu(dbs_boost_load_moved, this_cpu) = 0;
-
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power 
+            if(boost_game_only) {
+                if(game_flag){
+                    atomic_notifier_call_chain(&migration_notifier_head,
+                                   this_cpu,
+                                   (void *)cpu_of(busiest));
+                }
+            }
+            else
+                atomic_notifier_call_chain(&migration_notifier_head,
+                               this_cpu,
+                               (void *)cpu_of(busiest));
+#else
+            atomic_notifier_call_chain(&migration_notifier_head,
+                           this_cpu,
+                           (void *)cpu_of(busiest));
+#endif
 		}
 	}
 	if (likely(!active_balance)) {
@@ -5400,6 +5454,12 @@ static int active_load_balance_cpu_stop(void *data)
 	struct rq *target_rq = cpu_rq(target_cpu);
 	struct sched_domain *sd;
 
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+    int game_flag = 0;
+    int game_probe = 0;
+#endif
+
 	raw_spin_lock_irq(&busiest_rq->lock);
 
 	per_cpu(dbs_boost_load_moved, target_cpu) = 0;
@@ -5443,11 +5503,20 @@ static int active_load_balance_cpu_stop(void *data)
 
 		schedstat_inc(sd, alb_count);
 
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+        if (move_one_task(&env, &game_probe))
+#else
 		if (move_one_task(&env))
+#endif
 			schedstat_inc(sd, alb_pushed);
 		else
 			schedstat_inc(sd, alb_failed);
 	}
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+    game_flag |= game_probe;
+#endif
 	rcu_read_unlock();
 	double_unlock_balance(busiest_rq, target_rq);
 out_unlock:
@@ -5466,6 +5535,24 @@ out_unlock:
 
 		per_cpu(dbs_boost_needed, target_cpu) = false;
 		per_cpu(dbs_boost_load_moved, target_cpu) = 0;
+#ifdef VENDOR_EDIT
+//add by huruihuan for tradeoff performence and power
+    if(boost_game_only) {
+        if(game_flag) 
+            atomic_notifier_call_chain(&migration_notifier_head,
+                           target_cpu,
+                           (void *)cpu_of(busiest_rq));
+    }
+    else
+        atomic_notifier_call_chain(&migration_notifier_head,
+                       target_cpu,
+                       (void *)cpu_of(busiest_rq));
+
+#else
+		atomic_notifier_call_chain(&migration_notifier_head,
+					   target_cpu,
+					   (void *)cpu_of(busiest_rq));
+#endif
 	}
 	return 0;
 }

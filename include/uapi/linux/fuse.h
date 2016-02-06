@@ -236,6 +236,9 @@ struct fuse_file_lock {
 #define FUSE_DO_READDIRPLUS	(1 << 13)
 #define FUSE_READDIRPLUS_AUTO	(1 << 14)
 #define FUSE_ASYNC_DIO		(1 << 15)
+#ifdef VENDOR_EDIT/*Add by liwei*/
+#define FUSE_SHORTCIRCUIT	(1 << 31)
+#endif
 
 /**
  * CUSE INIT request/reply flags
@@ -460,6 +463,13 @@ struct fuse_open_out {
 	uint64_t	fh;
 	uint32_t	open_flags;
 	uint32_t	padding;
+	__u64	fh;
+	__u32	open_flags;
+#ifndef VENDOR_EDIT
+	__u32	padding;
+#else
+	int32_t lower_fd;/* lower layer file descriptor */
+#endif
 };
 
 struct fuse_release_in {

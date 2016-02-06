@@ -94,6 +94,12 @@
 #include "internal.h"
 #include "fd.h"
 
+#ifdef VENDOR_EDIT
+//huruihuan add for regnoize game apps
+#include <linux/sched.h>
+#endif
+
+
 /* NOTE:
  *	Implementing inode permission operations in /proc is almost
  *	certainly an error.  Permission checks need to happen during
@@ -2512,6 +2518,195 @@ static const struct file_operations proc_coredump_filter_operations = {
 };
 #endif
 
+/*
+ * /proc/self:
+ */
+static int proc_self_readlink(struct dentry *dentry, char __user *buffer,
+			      int buflen)
+{
+	struct pid_namespace *ns = dentry->d_sb->s_fs_info;
+	pid_t tgid = task_tgid_nr_ns(current, ns);
+	char tmp[PROC_NUMBUF];
+	if (!tgid)
+		return -ENOENT;
+	sprintf(tmp, "%d", tgid);
+	return vfs_readlink(dentry,buffer,buflen,tmp);
+}
+
+static void *proc_self_follow_link(struct dentry *dentry, struct nameidata *nd)
+{
+	struct pid_namespace *ns = dentry->d_sb->s_fs_info;
+	pid_t tgid = task_tgid_nr_ns(current, ns);
+	char *name = ERR_PTR(-ENOENT);
+	if (tgid) {
+		name = __getname();
+		if (!name)
+			name = ERR_PTR(-ENOMEM);
+		else
+			sprintf(name, "%d", tgid);
+	}
+	nd_set_link(nd, name);
+	return NULL;
+}
+
+static void proc_self_put_link(struct dentry *dentry, struct nameidata *nd,
+				void *cookie)
+{
+	char *s = nd_get_link(nd);
+	if (!IS_ERR(s))
+		__putname(s);
+}
+
+static const struct inode_operations proc_self_inode_operations = {
+	.readlink	= proc_self_readlink,
+	.follow_link	= proc_self_follow_link,
+	.put_link	= proc_self_put_link,
+};
+
+//#ifdef VENDOR_EDIT
+//MaJunhai@OnePlus..MultiMediaService,2015/11/24, add /proc/process/task/taskid/cpuid || /proc/process/cpuid for perfLock
+static ssize_t proc_cpuid_read(struct file * file, char __user * buf,
+                  size_t count, loff_t *ppos)
+{
+    unsigned int cpuid;
+    unsigned long flags;
+    struct inode * inode = file->f_path.dentry->d_inode;
+    struct task_struct *task = get_proc_task(inode);
+    ssize_t length;
+    char tmpbuf[TMPBUFLEN];
+
+    if (!task)
+        return -ESRCH;
+
+    /* get thread cpu id */
+    //get_online_cpus();
+    //rcu_read_lock();
+
+    //task = pid ? find_task_by_vpid(pid) : current;
+    //if (!p) {
+    //  rcu_read_unlock();
+    //  put_online_cpus();
+    //  return -ESRCH;
+    //}
+
+    raw_spin_lock_irqsave(&task->pi_lock, flags);
+
+#ifdef CONFIG_SMP
+    smp_rmb();
+    cpuid = task_thread_info(task)->cpu;
+#endif
+    raw_spin_unlock_irqrestore(&task->pi_lock, flags);
+
+    //put_task_struct(p);
+    //put_online_cpus();
+    //printk("cpuid %d\n", cpuid);
+
+    length = scnprintf(tmpbuf, TMPBUFLEN, "%u\n",
+                cpuid);
+    put_task_struct(task);
+    return simple_read_from_buffer(buf, count, ppos, tmpbuf, length);
+}
+
+static const struct file_operations proc_cpuid_operations = {
+    .read       = proc_cpuid_read,
+    .llseek     = generic_file_llseek,
+};
+//endif
+
+/*
+ * proc base
+ *
+ * These are the directory entries in the root directory of /proc
+ * that properly belong to the /proc filesystem, as they describe
+ * describe something that is process related.
+ */
+static const struct pid_entry proc_base_stuff[] = {
+	NOD("self", S_IFLNK|S_IRWXUGO,
+		&proc_self_inode_operations, NULL, {}),
+};
+
+static struct dentry *proc_base_instantiate(struct inode *dir,
+	struct dentry *dentry, struct task_struct *task, const void *ptr)
+{
+	const struct pid_entry *p = ptr;
+	struct inode *inode;
+	struct proc_inode *ei;
+	struct dentry *error;
+
+	/* Allocate the inode */
+	error = ERR_PTR(-ENOMEM);
+	inode = new_inode(dir->i_sb);
+	if (!inode)
+		goto out;
+
+	/* Initialize the inode */
+	ei = PROC_I(inode);
+	inode->i_ino = get_next_ino();
+	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
+
+	/*
+	 * grab the reference to the task.
+	 */
+	ei->pid = get_task_pid(task, PIDTYPE_PID);
+	if (!ei->pid)
+		goto out_iput;
+
+	inode->i_mode = p->mode;
+	if (S_ISDIR(inode->i_mode))
+		set_nlink(inode, 2);
+	if (S_ISLNK(inode->i_mode))
+		inode->i_size = 64;
+	if (p->iop)
+		inode->i_op = p->iop;
+	if (p->fop)
+		inode->i_fop = p->fop;
+	ei->op = p->op;
+	d_add(dentry, inode);
+	error = NULL;
+out:
+	return error;
+out_iput:
+	iput(inode);
+	goto out;
+}
+
+static struct dentry *proc_base_lookup(struct inode *dir, struct dentry *dentry)
+{
+	struct dentry *error;
+	struct task_struct *task = get_proc_task(dir);
+	const struct pid_entry *p, *last;
+
+	error = ERR_PTR(-ENOENT);
+
+	if (!task)
+		goto out_no_task;
+
+	/* Lookup the directory entry */
+	last = &proc_base_stuff[ARRAY_SIZE(proc_base_stuff) - 1];
+	for (p = proc_base_stuff; p <= last; p++) {
+		if (p->len != dentry->d_name.len)
+			continue;
+		if (!memcmp(dentry->d_name.name, p->name, p->len))
+			break;
+	}
+	if (p > last)
+		goto out;
+
+	error = proc_base_instantiate(dir, dentry, task, p);
+
+out:
+	put_task_struct(task);
+out_no_task:
+	return error;
+}
+
+static int proc_base_fill_cache(struct file *filp, void *dirent,
+	filldir_t filldir, struct task_struct *task, const struct pid_entry *p)
+{
+	return proc_fill_cache(filp, dirent, filldir, p->name, p->len,
+				proc_base_instantiate, task, p);
+}
+
 #ifdef CONFIG_TASK_IO_ACCOUNTING
 static int do_io_accounting(struct task_struct *task, char *buffer, int whole)
 {
@@ -2660,6 +2855,15 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
+#ifdef VENDOR_EDIT
+//huruihuan add for regnoize game apps
+static int proc_pid_gameflag(struct seq_file *m, struct pid_namespace *ns,
+				struct pid *pid, struct task_struct *task)
+{
+    seq_printf(m, "%d\n", task->game_flag);
+    return 0;
+}
+#endif
 /*
  * Thread groups
  */
@@ -2681,6 +2885,10 @@ static const struct pid_entry tgid_base_stuff[] = {
 	INF("auxv",       S_IRUSR, proc_pid_auxv),
 	ONE("status",     S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUGO, proc_pid_personality),
+#ifdef VENDOR_EDIT
+//huruihuan add for regnoize game apps
+    ONE("gameflag", S_IRUGO, proc_pid_gameflag),
+#endif
 	INF("limits",	  S_IRUGO, proc_pid_limits),
 #ifdef CONFIG_SCHED_DEBUG
 	REG("sched",      S_IRUGO|S_IWUSR, proc_pid_sched_operations),
@@ -2759,6 +2967,11 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_CHECKPOINT_RESTORE
 	REG("timers",	  S_IRUGO, proc_timers_operations),
 #endif
+
+    //#ifdef VENDOR_EDIT
+    //MaJunhai@OnePlus..MultiMediaService,2015/11/24, add /proc/process/task/taskid/cpuid || /proc/process/cpuid for perfLock
+    REG("cpuid",  S_IRUGO, proc_cpuid_operations),
+    //#endif
 };
 
 static int proc_tgid_base_readdir(struct file * filp,
@@ -3038,6 +3251,10 @@ static const struct pid_entry tid_base_stuff[] = {
 	INF("auxv",      S_IRUSR, proc_pid_auxv),
 	ONE("status",    S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUGO, proc_pid_personality),
+#ifdef VENDOR_EDIT
+//huruihuan add for regnoize game apps
+    ONE("gameflag", S_IRUGO, proc_pid_gameflag),
+#endif
 	INF("limits",	 S_IRUGO, proc_pid_limits),
 #ifdef CONFIG_SCHED_DEBUG
 	REG("sched",     S_IRUGO|S_IWUSR, proc_pid_sched_operations),
@@ -3109,6 +3326,10 @@ static const struct pid_entry tid_base_stuff[] = {
 	REG("gid_map",    S_IRUGO|S_IWUSR, proc_gid_map_operations),
 	REG("projid_map", S_IRUGO|S_IWUSR, proc_projid_map_operations),
 #endif
+    //#ifdef VENDOR_EDIT
+    //MaJunhai@OnePlus..MultiMediaService,2015/11/24, add /proc/process/task/taskid/cpuid || /proc/process/cpuid for perfLock
+    REG("cpuid",  S_IRUGO, proc_cpuid_operations),
+    //#endif
 };
 
 static int proc_tid_base_readdir(struct file * filp,

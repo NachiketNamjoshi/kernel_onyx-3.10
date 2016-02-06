@@ -677,6 +677,12 @@ static int do_dentry_open(struct file *f,
 
 	path_get(&f->f_path);
 	inode = f->f_inode = f->f_path.dentry->d_inode;
+
+#ifndef VENDOR_EDIT
+	inode = dentry->d_inode;
+#else
+	inode = f->f_inode = dentry->d_inode;
+#endif
 	if (f->f_mode & FMODE_WRITE) {
 		error = __get_file_write_access(inode, f->f_path.mnt);
 		if (error)
@@ -741,6 +747,10 @@ cleanup_file:
 	f->f_path.dentry = NULL;
 	f->f_inode = NULL;
 	return error;
+	put_filp(f);
+	dput(dentry);
+	mntput(mnt);
+	return ERR_PTR(error);
 }
 
 /**

@@ -1082,6 +1082,9 @@ static int read_soc_params_raw(struct qpnp_bms_chip *chip,
 		raw->last_good_ocv_uv = chip->last_ocv_uv;
 		chip->new_battery = false;
 	} else if (chip->done_charging) {
+#ifdef CONFIG_VENDOR_EDIT
+		int ibat_ua, vbat_uv;
+#endif
 		chip->done_charging = false;
 		/* if we just finished charging, reset CC and fake 100% */
 		chip->ocv_reading_at_100 = raw->last_good_ocv_raw;
@@ -1094,7 +1097,13 @@ static int read_soc_params_raw(struct qpnp_bms_chip *chip,
 		chip->software_cc_uah = 0;
 		chip->software_shdw_cc_uah = 0;
 		chip->last_cc_uah = INT_MIN;
-		pr_debug("EOC Battery full ocv_reading = 0x%x\n",
+#ifdef CONFIG_VENDOR_EDIT
+		get_simultaneous_batt_v_and_i(chip, &ibat_ua, &vbat_uv);
+
+		pr_info("EOC Battery full vbat_uv = %d, ibat_ua = %d, batt_temp = %d, last_soc = %d, calculated_soc = %d\n",
+				vbat_uv, ibat_ua, batt_temp, chip->last_soc, chip->calculated_soc);
+#endif
+		pr_info("EOC Battery full ocv_reading = 0x%x\n",
 				chip->ocv_reading_at_100);
 	} else if (chip->prev_last_good_ocv_raw != raw->last_good_ocv_raw) {
 		convert_and_store_ocv(chip, raw, batt_temp, false);
@@ -1767,6 +1776,219 @@ static int report_voltage_based_soc(struct qpnp_bms_chip *chip)
 #define SOC_CATCHUP_SEC_MAX		600
 #define SOC_CATCHUP_SEC_PER_PERCENT	60
 #define MAX_CATCHUP_SOC	(SOC_CATCHUP_SEC_MAX / SOC_CATCHUP_SEC_PER_PERCENT)
+
+#ifdef CONFIG_VENDOR_EDIT
+// discharge
+#define SOC_CHANGE_PER_SEC_DISCHARGE_AT_100		300
+#define SOC_CHANGE_PER_SEC_DISCHARGE_AT_99_95	150
+#define SOC_CHANGE_PER_SEC_DISCHARGE_AT_95_60	60
+#define SOC_CHANGE_PER_SEC_DISCHARGE_AT_60_0	40
+
+#define SOC_CHANGE_CHARGE_DONE		60
+#define SOC_CHANGE_PER_SEC			40
+//#define LOW_SOC_CHANGE_PER_SEC		20
+#define LOW_VBAT_CHANGE_PER_SEC		12
+
+#define REPORT_SOC_WAIT_MS		10000
+static int report_cc_based_soc(struct qpnp_bms_chip *chip)
+{
+	int soc, soc_change = 0;
+	int time_since_last_change_sec, charge_time_sec = 0;
+	unsigned long last_change_sec;
+	struct timespec now;
+	struct qpnp_vadc_result result;
+	int batt_temp, ibat_ua = 0, vbat_uv = 0;
+	int rc;
+	bool charging, charging_since_last_report;
+
+	rc = wait_event_interruptible_timeout(chip->bms_wait_queue,
+			chip->calculated_soc != -EINVAL,
+			round_jiffies_relative(msecs_to_jiffies
+			(REPORT_SOC_WAIT_MS)));
+
+	if (rc == 0 && chip->calculated_soc == -EINVAL) {
+		pr_debug("calculate soc timed out\n");
+	} else if (rc == -ERESTARTSYS) {
+		pr_err("Wait for SoC interrupted.\n");
+		return rc;
+	}
+
+	rc = qpnp_vadc_read(chip->vadc_dev, LR_MUX1_BATT_THERM, &result);
+
+	if (rc) {
+		pr_err("error reading adc channel = %d, rc = %d\n",
+					LR_MUX1_BATT_THERM, rc);
+		return rc;
+	}
+	pr_debug("batt_temp phy = %lld meas = 0x%llx\n", result.physical,
+						result.measurement);
+	batt_temp = (int)result.physical;
+	
+
+	rc = get_battery_voltage(chip, &vbat_uv);
+	if (rc < 0) {
+		pr_err("adc vbat failed err = %d\n", rc);
+	}
+
+	mutex_lock(&chip->last_soc_mutex);
+	soc = chip->calculated_soc;
+
+	last_change_sec = chip->last_soc_change_sec;
+	calculate_delta_time(&last_change_sec, &time_since_last_change_sec);
+
+	charging = chip->battery_status == POWER_SUPPLY_STATUS_CHARGING;
+	charging_since_last_report = charging || (chip->last_soc_unbound
+			&& chip->was_charging_at_sleep);
+	/*
+	 * account for charge time - limit it to SOC_CATCHUP_SEC to
+	 * avoid overflows when charging continues for extended periods
+	 */
+	if (charging) {
+		if (chip->charge_start_tm_sec == 0) {
+			/*
+			 * calculating soc for the first time
+			 * after start of chg. Initialize catchup time
+			 */
+			if (abs(soc - chip->last_soc) < MAX_CATCHUP_SOC)
+				chip->catch_up_time_sec =
+				(soc - chip->last_soc)
+					* SOC_CATCHUP_SEC_PER_PERCENT;
+			else
+				chip->catch_up_time_sec = SOC_CATCHUP_SEC_MAX;
+
+			if (chip->catch_up_time_sec < 0)
+				chip->catch_up_time_sec = 0;
+			chip->charge_start_tm_sec = last_change_sec;
+		}
+
+		charge_time_sec = min(SOC_CATCHUP_SEC_MAX, (int)last_change_sec
+				- chip->charge_start_tm_sec);
+
+		/* end catchup if calculated soc and last soc are same */
+		if (chip->last_soc == soc)
+			chip->catch_up_time_sec = 0;
+
+		if (soc == 99)
+			soc = 100;
+	}
+
+	if (chip->last_soc != -EINVAL) {
+		/*
+		 * last_soc < soc  ... if we have not been charging at all
+		 * since the last time this was called, report previous SoC.
+		 * Otherwise, scale and catch up.
+		 */
+		if (chip->last_soc < soc && !charging_since_last_report)
+			soc = chip->last_soc;
+		else if (chip->last_soc < soc && soc != 100)
+			soc = scale_soc_while_chg(chip, charge_time_sec,
+					chip->catch_up_time_sec,
+					soc, chip->last_soc);
+		/* if the battery is close to cutoff allow more change */
+		/*if (wake_lock_active(&chip->low_voltage_wake_lock)) {
+			soc_change = min((int)abs(chip->last_soc - soc),
+				time_since_last_change_sec
+					/ LOW_SOC_CHANGE_PER_SEC);
+//		else if (chip->last_soc <= chip->adjust_soc_low_threshold)
+//			soc_change = min((int)abs(chip->last_soc - soc),
+//				time_since_last_change_sec
+//					/ LOW_SOC_CHANGE_PER_SEC);
+//
+		}
+		else */
+		if (!charging) {
+			int soc_change_per_sec;
+
+			if (chip->last_soc == 100)
+				soc_change_per_sec = SOC_CHANGE_PER_SEC_DISCHARGE_AT_100;
+			else if (chip->last_soc > 95 && chip->last_soc <= 99)
+				soc_change_per_sec = SOC_CHANGE_PER_SEC_DISCHARGE_AT_99_95;
+			else if (chip->last_soc > 60 && chip->last_soc <= 95)
+				soc_change_per_sec = SOC_CHANGE_PER_SEC_DISCHARGE_AT_95_60;
+			else if (vbat_uv <= 3300 * 1000)
+				soc_change_per_sec = LOW_VBAT_CHANGE_PER_SEC;
+			else
+				soc_change_per_sec = SOC_CHANGE_PER_SEC_DISCHARGE_AT_60_0;
+
+			/*if (batt_temp < 0)
+				soc_change_per_sec /= 2;*/
+				
+			soc_change = min((int)abs(chip->last_soc - soc),
+					time_since_last_change_sec / soc_change_per_sec);
+
+		}
+//
+		else {
+			soc_change = min((int)abs(chip->last_soc - soc),
+					time_since_last_change_sec
+						/ SOC_CHANGE_PER_SEC);
+		}
+
+		if (charging && chip->chg_done && chip->last_soc != 100) {
+			soc = 100;
+			soc_change = min((int)abs(chip->last_soc - soc),
+				time_since_last_change_sec
+					/ SOC_CHANGE_CHARGE_DONE);
+			//pr_info("chip->chg_done == true, soc != 100\n");
+		}
+
+		if (chip->last_soc_unbound) {
+			chip->last_soc_unbound = false;
+		} else {
+			/*
+			 * if soc have not been unbound by resume,
+			 * only change reported SoC by 1.
+			 */
+			soc_change = min(1, soc_change);
+		}
+
+		if (soc < chip->last_soc)
+			soc = chip->last_soc - soc_change;
+		if (soc > chip->last_soc)
+			soc = chip->last_soc + soc_change;
+
+	}
+
+	if (chip->battery_status == POWER_SUPPLY_STATUS_FULL && chip->last_soc == 100) {
+		soc = 100;
+		soc_change = 0;
+		chip->last_soc_change_sec = last_change_sec;
+		//pr_debug("chip->battery_status == POWER_SUPPLY_STATUS_FULL Reported SOC = 100\n");
+	}
+
+
+	if (chip->last_soc != soc && !chip->last_soc_unbound)
+		chip->last_soc_change_sec = last_change_sec;
+
+	pr_debug("last_soc = %d, calculated_soc = %d, soc = %d, time since last change = %d\n",
+			chip->last_soc, chip->calculated_soc,
+			soc, time_since_last_change_sec);
+
+	soc = bound_soc(soc);
+	chip->last_soc = soc;
+
+	backup_soc_and_iavg(chip, batt_temp, chip->last_soc);
+	pr_debug("Reported SOC = %d\n", chip->last_soc);
+	chip->t_soc_queried = now;
+	mutex_unlock(&chip->last_soc_mutex);
+
+	if (soc_change && chip->bms_psy_registered) {
+		power_supply_changed(&chip->bms_psy);
+		rc = get_battery_current(chip, &ibat_ua);
+		if (rc) {
+			pr_err("adc ibat failed err = %d\n", rc);
+		}
+		pr_info("batt_temp = %d, ibat_ua = %d, vbat_uv = %d\n", batt_temp, ibat_ua, vbat_uv);
+		pr_info("Reported SOC = %d, Calculated SOC = %d\n", chip->last_soc, chip->calculated_soc);
+		pr_debug("power supply changed\n");
+	}
+
+
+	return soc;
+}
+
+#else
+
 #define SOC_CHANGE_PER_SEC		5
 #define REPORT_SOC_WAIT_MS		10000
 static int report_cc_based_soc(struct qpnp_bms_chip *chip)
@@ -3278,7 +3500,12 @@ static void battery_status_check(struct qpnp_bms_chip *chip)
 			recalculate_soc(chip);
 		} else if (chip->battery_status
 				== POWER_SUPPLY_STATUS_FULL) {
+
 			pr_debug("battery not full any more\n");
+#ifdef CONFIG_VENDOR_EDIT
+			get_current_time(&(chip->last_recalc_time));
+			chip->last_soc_change_sec = chip->last_recalc_time;
+#endif
 			disable_bms_irq(&chip->ocv_thr_irq);
 			disable_bms_irq(&chip->sw_cc_thr_irq);
 		}
@@ -3346,7 +3573,9 @@ static void battery_insertion_check(struct qpnp_bms_chip *chip)
 /* Returns capacity as a SoC percentage between 0 and 100 */
 static int get_prop_bms_capacity(struct qpnp_bms_chip *chip)
 {
+
 	return report_state_of_charge(chip);
+
 }
 
 static void qpnp_bms_external_power_changed(struct power_supply *psy)

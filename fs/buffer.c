@@ -929,7 +929,7 @@ static sector_t blkdev_max_block(struct block_device *bdev, unsigned int size)
 
 /*
  * Initialise the state of a blockdev page's buffers.
- */ 
+ */
 static sector_t
 init_page_buffers(struct page *page, struct block_device *bdev,
 			sector_t block, int size)

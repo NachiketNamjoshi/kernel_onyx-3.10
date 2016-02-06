@@ -461,6 +461,11 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	err = req->out.h.error;
 	if (err)
 		goto out_free_ff;
+	}
+#ifdef VENDOR_EDIT/*add by liwei*/
+	if (req->private_lower_rw_file != NULL)
+		ff->rw_lower_file = req->private_lower_rw_file;
+#endif
 
 	err = -EIO;
 	if (!S_ISREG(outentry.attr.mode) || invalid_nodeid(outentry.nodeid))
