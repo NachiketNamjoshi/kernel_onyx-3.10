@@ -35,6 +35,9 @@ config ARCH_MSM8974
 	select USB_ARCH_HAS_XHCI
 	select ENABLE_VMALLOC_SAVINGS
 	select MSM_IRQ
+	select MSM_SMD
+	select MSM_SMEM
+	select REMOTE_SPINLOCK_MSM
 
 config ARCH_APQ8084
 	bool "APQ8084"
